@@ -472,7 +472,7 @@
         "unreadableMessage": "Súbor modelu nakonfigurovaný pre {modelName} existuje, ale nepodarilo sa ho prečítať, preto sa namiesto neho používa nainštalovaný model v {modelPath}. Vaša konfigurácia zostala nezmenená. Skontrolujte oprávnenia súboru a to, či je jeho úložisko pripojené.",
         "builtinMessage": "Súbor modelu nakonfigurovaný pre {modelName} sa na disku nenašiel a nie je k dispozícii žiadny nainštalovaný model, ktorý by ho nahradil, preto sa namiesto neho používa vstavaný model. Vaša konfigurácia zostala nezmenená.",
         "notRegisteredTitle": "Žiadny model neanalyzuje {sourceName}",
-        "notRegisteredMessage": "K {models} na zvukovom zdroji \"{sourceName}\" sa nedostáva žiadny zvuk, takže sa nevytvárajú žiadne detekcie. Otvorte galériu modelov v Nastaveniach a skontrolujte stav."
+        "notRegisteredMessage": "K {models} na zvukovom zdroji \"{sourceName}\" sa nedostáva žiadny zvuk, takže sa nevytvárajú žiadne detekcie. Otvorte Systém > Modely AI, skontrolujte jeho stav pre jednotlivé zdroje a overte, že je zdroj zvuku pripojený a odosiela zvuk."
       },
       "alert": {
         "firedTitle": "{rule_name}",
@@ -1779,7 +1779,10 @@
       "noSources": "Žiadne pripojené zdroje",
       "primaryFallback": "primárny (záložný)",
       "sourceNotRunning": "neanalyzuje",
-      "sourceNotRunningTooltip": "Tento zdroj je v nastaveniach priradený k modelu, ale jeho zvuk sa k modelu nedostáva, takže nevytvára žiadne detekcie. Otvorte galériu modelov v Nastaveniach a skontrolujte jeho stav.",
+      "sourceNotRunningTooltip": "Tento zdroj je v nastaveniach priradený k modelu, ale jeho zvuk sa k modelu nedostáva, takže nevytvára žiadne detekcie. Skontrolujte, či je zdroj zvuku pripojený a odosiela zvuk.",
+      "modelNotAnalyzingTooltip": "Jeden alebo viac zdrojov zvuku priradených k tomuto modelu mu neodosiela zvuk, takže nevytvára žiadne detekcie. Pozrite si zdroje uvedené nižšie.",
+      "sourcesDegraded": "{count} z {total} zdrojov mimo prevádzky",
+      "sourcesDegradedTooltip": "Niektoré, ale nie všetky zdroje zvuku tohto modelu sú mimo prevádzky, takže model stále analyzuje prostredníctvom tých funkčných. Konkrétny zdroj mimo prevádzky a spôsob, ako ho opraviť, sú uvedené nižšie.",
       "notMeasured": "n/a",
       "unitMs": "ms",
       "unitKhz": "kHz",
@@ -2367,7 +2370,19 @@
           "description": "Obmedziť detekciu na druhy pravdepodobné vo vašom geografickom regióne",
           "stationLocation": {
             "label": "Poloha stanice",
-            "helpText": "Poloha stanice, používaná pre údaje o počasí a na obmedzenie druhov vtákov na tie, ktoré sú v regióne pravdepodobné."
+            "helpText": "Poloha stanice, používaná pre údaje o počasí a na obmedzenie druhov vtákov na tie, ktoré sú v regióne pravdepodobné.",
+            "automaticLocation": "Automatické určenie polohy",
+            "useCurrentLocation": "Použiť polohu prehliadača",
+            "locationHelp": "Vyplní súradnice pomocou polohy tohto prehliadača.",
+            "locating": "Zisťovanie polohy...",
+            "accuracy": "Odhadovaná presnosť: do {accuracy} m",
+            "locationDetected": "Poloha prehliadača bola zistená.",
+            "geolocationUnsupported": "Tento prehliadač nepodporuje určovanie polohy zariadenia. Zadajte súradnice ručne alebo použite mapu.",
+            "geolocationRequiresHttps": "Určovanie polohy prehliadača vyžaduje HTTPS alebo localhost. Zadajte súradnice ručne alebo použite mapu.",
+            "geolocationDenied": "Prístup k polohe bol zamietnutý. Zadajte súradnice ručne alebo použite mapu.",
+            "geolocationUnavailable": "Zariadenie nedokázalo určiť svoju polohu. Zadajte súradnice ručne alebo použite mapu.",
+            "geolocationTimedOut": "Vypršal časový limit požiadavky na polohu. Skúste to znova, zadajte súradnice ručne alebo použite mapu.",
+            "geolocationFailed": "Polohu zariadenia sa nepodarilo určiť. Zadajte súradnice ručne alebo použite mapu."
           },
           "latitude": {
             "label": "Zemepisná šírka",
@@ -2905,6 +2920,7 @@
             "shoutrrrDocs": "https://github.com/nicholas-fedor/shoutrrr?tab=readme-ov-file#supported-services"
           },
           "saveButton": "Uložiť poskytovateľa",
+          "saveWaitingNtfyCheck": "Čaká sa na dokončenie kontroly pripojenia ntfy",
           "savingButton": "Ukladá sa...",
           "cancelButton": "Zrušiť",
           "testButton": "Testovať",
@@ -2976,6 +2992,7 @@
               "http": "HTTP funguje - server nepoužíva HTTPS"
             },
             "connectionFailed": "Nedá sa pripojiť - skontrolujte názov hostiteľa a stav servera",
+            "checkError": "Server sa nepodarilo overiť - skontrolujte adresu alebo znovu načítajte stránku a skúste to znova",
             "auth": {
               "label": "Autentifikácia (voliteľné)",
               "username": {
@@ -4412,7 +4429,7 @@
       "dynamicThreshold": {
         "tabLabel": "Učené",
         "title": "Naučené prahy",
-        "description": "Táto stránka zobrazuje runtime dáta dynamického prahu. Keď je povolený v Hlavných nastaveniach → Detekcia, prahy sa automaticky upravujú na základe viacerých detekcií s vysokou istotou. Druhy zobrazené tu sa považujú za existujúce na tomto mieste.",
+        "description": "Táto stránka zobrazuje runtime dáta dynamického prahu. Keď je povolený, prahy sa automaticky upravujú na základe viacerých detekcií s vysokou istotou. Druhy zobrazené tu sa považujú za existujúce na tomto mieste.",
         "stats": {
           "active": "Aktívne",
           "atMinimum": "Na minime",
@@ -4914,7 +4931,16 @@
       "streamTitleDefault": "Audio stream vtákov",
       "streamArtist": "BirdNET-Go",
       "streamAlbum": "Živé vysielanie",
-      "playbackError": "Chyba prehrávania: {details}"
+      "playbackError": "Chyba prehrávania: {details}",
+      "audibleBats": {
+        "title": "Počuteľné prehrávanie netopierov",
+        "subtitle": "Spomalí ultrazvukové volania do rozsahu počuteľného pre človeka.",
+        "timeExpansion": "Časové roztiahnutie",
+        "enable": "Zapnúť",
+        "disable": "Vypnúť",
+        "generating": "Generuje sa odvodený zvuk…",
+        "error": "Nepodarilo sa vygenerovať počuteľný zvuk netopierov"
+      }
     },
     "spectrogram": {
       "notGenerated": "Spektrogram ešte nebol vygenerovaný",
@@ -5146,6 +5172,7 @@
       "notFound": "Oznámenie sa nenašlo",
       "hostRequired": "Parameter hostiteľa je povinný",
       "invalidHost": "Neplatný parameter hostiteľa",
+      "invalidBody": "Neplatné telo požiadavky",
       "rateLimit": "Príliš veľa pokusov o pripojenie k prúdu oznámení, počkajte chvíľu pred ďalším pokusom"
     },
     "streams": {

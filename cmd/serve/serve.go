@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -54,12 +55,17 @@ The "realtime" command is an alias for backward compatibility.`,
 			engineTransport := settings.Realtime.RTSP.ResolveTransport("")
 
 			audioEngine := engine.New(cmd.Context(), &engine.Config{
-				FFmpegPath:           settings.Realtime.Audio.FfmpegPath,
-				SoxPath:              settings.Realtime.Audio.SoxPath,
-				Transport:            engineTransport,
-				FFmpegParameters:     settings.Realtime.RTSP.FFmpegParameters,
-				Debug:                settings.Debug,
-				CaptureBufferSeconds: settings.Realtime.ExtendedCapture.EffectiveCaptureBufferSeconds(settings.Realtime.Audio.Export.PreCapture),
+				FFmpegPath:               settings.Realtime.Audio.FfmpegPath,
+				SoxPath:                  settings.Realtime.Audio.SoxPath,
+				Transport:                engineTransport,
+				FFmpegParameters:         settings.Realtime.RTSP.FFmpegParameters,
+				Debug:                    settings.Debug,
+				CaptureBufferSeconds:     settings.Realtime.ExtendedCapture.EffectiveCaptureBufferSeconds(settings.Realtime.Audio.Export.PreCapture),
+				LivenessSilenceThreshold: time.Duration(settings.Realtime.Audio.Watchdog.SilenceThreshold) * time.Second,
+				// StreamMetrics is the concrete Prometheus collector for both the
+				// FFmpeg and native stream producers. The engine forwards it to
+				// whichever manager the BIRDNET_STREAM_INGEST gate selects.
+				StreamMetrics: metrics.AudioStream,
 			}, nil)
 			defer audioEngine.Stop()
 
