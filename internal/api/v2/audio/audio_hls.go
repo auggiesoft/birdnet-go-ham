@@ -116,7 +116,6 @@ type HLSStreamStatus struct {
 	PlaylistURL   string `json:"playlist_url,omitempty"` // API URL for the playlist (not filesystem path)
 	ActiveClients int    `json:"active_clients"`
 	PlaylistReady bool   `json:"playlist_ready"`
-	Raw           bool   `json:"raw"`                    // Stream bypasses the station's equalizer (browser-side EQ monitor)
 	StreamEpoch   string `json:"stream_epoch,omitempty"` // ISO8601 wall-clock time of stream position 0
 }
 
@@ -196,29 +195,6 @@ const (
 	HLSPlaylistPath   = "/:streamToken/playlist.m3u8"
 	HLSContentPath    = "/:streamToken/*"
 )
-
-// hlsRawQueryParam requests a stream that bypasses the station's equalizer.
-const hlsRawQueryParam = "raw"
-
-// hlsRawStreamSuffix distinguishes a raw stream's key from the normal stream of the
-// same source in the stream registry, activity tracking and token map.
-const hlsRawStreamSuffix = "|raw"
-
-// hlsStreamKey returns the registry key for a source's normal or raw stream.
-func hlsStreamKey(sourceID string, raw bool) string {
-	if raw {
-		return sourceID + hlsRawStreamSuffix
-	}
-	return sourceID
-}
-
-// splitHLSStreamKey recovers the audio source ID and the raw flag from a stream key.
-func splitHLSStreamKey(key string) (sourceID string, raw bool) {
-	if id, ok := strings.CutSuffix(key, hlsRawStreamSuffix); ok {
-		return id, true
-	}
-	return key, false
-}
 
 // hlsPlaylistURL builds the client-facing playlist URL for a stream token from
 // the same route constants used to register the playlist route (see
@@ -336,11 +312,6 @@ func (c *Handler) StartHLSStream(ctx echo.Context) error {
 	if err != nil {
 		return err
 	}
-	// A raw stream carries the source without the station's equalizer, for a
-	// listener auditioning filters in the browser. It is a separate stream with
-	// its own key, so listeners of the normal stream and the analysis are untouched.
-	raw := ctx.QueryParam(hlsRawQueryParam) == queryValueTrue
-	streamKey := hlsStreamKey(sourceID, raw)
 
 	// Bind optional request body for session_id
 	var req HLSSessionRequest
@@ -362,8 +333,7 @@ func (c *Handler) StartHLSStream(ctx echo.Context) error {
 	c.LogAPIRequest(ctx, logger.LogLevelInfo, "HLS stream start requested",
 		logger.String("source_id", privacy.SanitizeRTSPUrl(sourceID)),
 		logger.String("client_id", clientID),
-		logger.Bool("force_restart", forceRestart),
-		logger.Bool("raw", raw))
+		logger.Bool("force_restart", forceRestart))
 
 	// Verify source exists by checking for a capture buffer
 	eng := c.Engine.Load()
@@ -375,21 +345,21 @@ func (c *Handler) StartHLSStream(ctx echo.Context) error {
 	}
 
 	// Check for existing healthy stream first (reuse if possible)
-	if existingStream := c.getHLSStream(streamKey); existingStream != nil && !forceRestart {
+	if existingStream := c.getHLSStream(sourceID); existingStream != nil && !forceRestart {
 		// Existing stream found - register client and reuse it
-		c.updateHLSActivity(streamKey, clientID, "stream_join", hlsNewStreamGracePeriod)
+		c.updateHLSActivity(sourceID, clientID, "stream_join", hlsNewStreamGracePeriod)
 		c.LogAPIRequest(ctx, logger.LogLevelInfo, "Reusing existing HLS stream",
 			logger.String("source_id", privacy.SanitizeRTSPUrl(sourceID)),
 			logger.String("client_id", clientID))
-		return c.buildHLSStreamResponse(ctx, streamKey, existingStream)
+		return c.buildHLSStreamResponse(ctx, sourceID, existingStream)
 	}
 
 	// Create or get the HLS stream (force-restart uses atomic cleanup+create)
 	var stream *HLSStreamInfo
 	if forceRestart {
-		stream, err = c.forceCreateHLSStream(streamKey)
+		stream, err = c.forceCreateHLSStream(sourceID)
 	} else {
-		stream, err = c.getOrCreateHLSStream(streamKey)
+		stream, err = c.getOrCreateHLSStream(sourceID)
 	}
 	if err != nil {
 		c.LogAPIRequest(ctx, logger.LogLevelError, "Failed to create HLS stream",
@@ -400,12 +370,12 @@ func (c *Handler) StartHLSStream(ctx echo.Context) error {
 
 	// Register client AFTER stream creation so force-restart gets clean tracking
 	// (forceCreateHLSStream clears stale tracking before creating the new stream)
-	c.updateHLSActivity(streamKey, clientID, "stream_start", hlsNewStreamGracePeriod)
+	c.updateHLSActivity(sourceID, clientID, "stream_start", hlsNewStreamGracePeriod)
 
 	// Check if playlist is ready
-	playlistReady := c.waitForHLSPlaylist(ctx, streamKey, stream)
+	playlistReady := c.waitForHLSPlaylist(ctx, sourceID, stream)
 
-	return c.buildHLSStreamResponse(ctx, streamKey, stream, playlistReady)
+	return c.buildHLSStreamResponse(ctx, sourceID, stream, playlistReady)
 }
 
 // respondNoCaptureBuffer builds a diagnostic 404 for a live-audio start request
@@ -467,9 +437,6 @@ func (c *Handler) buildHLSStreamResponse(ctx echo.Context, sourceID string, stre
 	// Get client count
 	clientCount := getStreamClientCount(sourceID)
 
-	// sourceID is the stream key here; the client sees the plain source and the raw flag.
-	plainSourceID, raw := splitHLSStreamKey(sourceID)
-
 	// Generate or retrieve stream token for secure URL access
 	token, err := getOrCreateStreamToken(sourceID)
 	if err != nil {
@@ -505,12 +472,11 @@ func (c *Handler) buildHLSStreamResponse(ctx echo.Context, sourceID string, stre
 
 	return ctx.JSON(http.StatusOK, HLSStreamStatus{
 		Status:        status,
-		Source:        url.PathEscape(plainSourceID),
+		Source:        url.PathEscape(sourceID),
 		StreamToken:   token,
 		PlaylistURL:   playlistURL,
 		ActiveClients: clientCount,
 		PlaylistReady: isReady,
-		Raw:           raw,
 		StreamEpoch:   epochStr,
 	})
 }
@@ -531,7 +497,6 @@ func (c *Handler) StopHLSStream(ctx echo.Context) error {
 	if err != nil {
 		return err
 	}
-	sourceID = hlsStreamKey(sourceID, ctx.QueryParam(hlsRawQueryParam) == queryValueTrue)
 
 	// Bind optional request body for session_id
 	var req HLSSessionRequest
@@ -606,8 +571,7 @@ func (c *Handler) GetHLSStatus(ctx echo.Context) error {
 
 	streams := make([]HLSStreamStatus, 0, len(streamsCopy))
 	for sourceID, stream := range streamsCopy {
-		plainSourceID, raw := splitHLSStreamKey(sourceID)
-		encodedSourceID := url.PathEscape(plainSourceID)
+		encodedSourceID := url.PathEscape(sourceID)
 
 		// Use token-based playlist URL if token exists
 		var playlistURL string
@@ -628,7 +592,6 @@ func (c *Handler) GetHLSStatus(ctx echo.Context) error {
 			PlaylistURL:   playlistURL,
 			ActiveClients: getStreamClientCount(sourceID),
 			PlaylistReady: playlistReady,
-			Raw:           raw,
 		})
 	}
 
@@ -1109,7 +1072,7 @@ func (h *hlsConsumer) Close() error {
 // whenever the source differs from it. maxQueuedBytes is the queue's byte
 // budget, or hlsFeedQueueUnbounded to leave the channel's slot count as the only
 // bound; see audioFeed for why the bound is in bytes rather than chunks.
-func (c *Handler) setupAudioCallback(sourceID string, raw bool, sampleRate int, maxQueuedBytes int64) (feed *audioFeed, cleanup func(), err error) {
+func (c *Handler) setupAudioCallback(sourceID string, sampleRate int, maxQueuedBytes int64) (feed *audioFeed, cleanup func(), err error) {
 	feed = &audioFeed{
 		ch:       make(chan audioChunk, defaultReadBufferSize),
 		maxBytes: maxQueuedBytes,
@@ -1167,15 +1130,7 @@ func (c *Handler) setupAudioCallback(sourceID string, raw bool, sampleRate int, 
 	}
 
 	// Add route on the AudioRouter
-	var routeErr error
-	if raw {
-		// The listener applies their own filters in the browser; the station's must
-		// not run on top of them, now or after a later equalizer change.
-		routeErr = eng.Router().AddRawRoute(sourceID, consumer, sourceSampleRate, gainDB)
-	} else {
-		routeErr = eng.Router().AddRoute(sourceID, consumer, sourceSampleRate, gainDB, eqChain)
-	}
-	if routeErr != nil {
+	if routeErr := eng.Router().AddRoute(sourceID, consumer, sourceSampleRate, gainDB, eqChain); routeErr != nil {
 		return nil, nil, fmt.Errorf("failed to add HLS route: %w", routeErr)
 	}
 

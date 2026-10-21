@@ -28,9 +28,7 @@ func BuildFilterChain(settings conf.EqualizerSettings, sampleRate int) *FilterCh
 
 	for i := range settings.Filters {
 		f := &settings.Filters[i]
-		// Zero (the pre-slope-selector default) means one pass; the ceiling guards CPU on
-		// every route against a hand-edited config, since validation runs only when EQ is on.
-		passes := min(max(f.Passes, 1), conf.MaxEQPasses)
+		passes := max(f.Passes, 1)
 
 		filter, err := buildFilter(f, sr, passes)
 		if err != nil {
