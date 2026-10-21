@@ -116,6 +116,17 @@ type Interface interface {
 	SearchNotesAdvanced(filters *AdvancedSearchFilters) ([]Note, int64, error)
 	GetNoteClipPath(noteID string) (string, error)
 	GetNoteModelType(noteID string) (string, error)
+	GetNoteKeptSpectrogram(noteID string) (clipName, modelType string, err error)
+	// RecordClipSampleRate sets the stored clip sample rate (Hz) of the detection
+	// when its clip_name still equals clipName, overwriting any existing value. It
+	// is authoritative and used to correct a rate planned before the clip was written.
+	// Only the v2-only store persists it; the legacy store has no such column.
+	RecordClipSampleRate(ctx context.Context, noteID uint, clipName string, rate int) error
+	// FillClipSampleRate stores rate (Hz) only while the detection's clip_sample_rate
+	// is NULL and its clip_name still equals clipName. It reports whether a row
+	// changed, so concurrent or repeated fills converge and never overwrite a value
+	// written by the exporter. Only the v2-only store persists it.
+	FillClipSampleRate(ctx context.Context, noteID uint, clipName string, rate int) (bool, error)
 	DeleteNoteClipPath(noteID string) error
 	GetNoteReview(noteID string) (*NoteReview, error)
 	SaveNoteReview(review *NoteReview) error
@@ -181,6 +192,7 @@ type Interface interface {
 	GetAllImageCaches(providerName string) ([]ImageCache, error)
 	GetLockedNotesClipPaths() ([]string, error)
 	ClearNoteClipPathsByNames(clipNames []string) (int64, error)
+	RetainNoteSpectrogramsByClipNames(clipNames []string) (int64, error)
 	GetNoteClipReferences(afterID uint, limit int) ([]diskmanager.ClipReference, error)
 	CountHourlyDetections(date, hour string, duration int) (int64, error)
 	// Analytics methods
@@ -271,12 +283,6 @@ type Interface interface {
 	CountDetectionsSince(ctx context.Context, since time.Time) (int, error)
 	// SchemaVersion returns the datastore schema version ("legacy" or "v2").
 	SchemaVersion() string
-	// UpdateNameMaps rebuilds species name lookup maps from updated BirdNET labels.
-	// Called after locale or model changes. No-op for legacy datastores.
-	UpdateNameMaps(labels []string)
-	// SetNameResolver installs the authoritative localized species-name resolver
-	// shared with the classifier orchestrator. No-op for legacy datastores.
-	SetNameResolver(resolver SpeciesNameResolver)
 
 	// Application event log (v2 only; legacy stores return nil/empty)
 	SaveAppEvent(ctx context.Context, category, eventType, message string, metadata map[string]any) error
@@ -305,12 +311,11 @@ type DatabaseStats struct {
 
 // DataStore implements StoreInterface using a GORM database.
 type DataStore struct {
-	DB            *gorm.DB          // GORM database instance
-	SunCalc       *suncalc.SunCalc  // Instance for calculating sun times (Assumed initialized)
-	sunTimesCache sync.Map          // Thread-safe map for caching sun times by date
-	metrics       *Metrics          // Metrics instance for tracking operations
-	metricsMu     sync.RWMutex      // Mutex to protect metrics field access
-	dbCounters    *dbstats.Counters // Atomic counters for query latency tracking
+	DB         *gorm.DB          // GORM database instance
+	SunCalc    *suncalc.SunCalc  // Instance for calculating sun times (Assumed initialized)
+	metrics    *Metrics          // Metrics instance for tracking operations
+	metricsMu  sync.RWMutex      // Mutex to protect metrics field access
+	dbCounters *dbstats.Counters // Atomic counters for query latency tracking
 
 	// Monitoring lifecycle management
 	monitoringCtx    context.Context    // Context for monitoring goroutines
@@ -346,8 +351,9 @@ func (ds *DataStore) CountDetectionsSince(ctx context.Context, since time.Time) 
 
 // NewDataStore creates a new DataStore instance based on the provided configuration context.
 func New(settings *conf.Settings) Interface {
-	// Create a SunCalc instance to be shared by all datastore implementations
-	sunCalc := suncalc.NewSunCalc(settings.BirdNET.Latitude, settings.BirdNET.Longitude)
+	// Create a SunCalc instance to be shared by all datastore implementations. It follows the
+	// live station location so a location change in the settings takes effect without a restart.
+	sunCalc := suncalc.NewSunCalcWithSource(conf.LiveLocation(settings))
 
 	switch {
 	case settings.Output.SQLite.Enabled:
@@ -361,7 +367,7 @@ func New(settings *conf.Settings) Interface {
 			SunCalc:  sunCalc,
 		}
 	default:
-		// No database explicitly enabled — default to SQLite
+		// No database explicitly enabled, default to SQLite
 		return &SQLiteStore{
 			Settings: settings,
 			SunCalc:  sunCalc,
@@ -388,9 +394,6 @@ func (ds *DataStore) GetDBCounters() *dbstats.Counters {
 	return ds.dbCounters
 }
 
-// UpdateNameMaps is a no-op for legacy DataStore (common names stored directly in DB).
-func (ds *DataStore) UpdateNameMaps(_ []string) {}
-
 // SpeciesNameResolver resolves a scientific name to a localized common name,
 // returning "" when unknown. Satisfied by *openfauna.Resolver. The locale argument
 // is accepted for interface symmetry; resolvers are built for the active species
@@ -415,9 +418,6 @@ func IsNilResolver(r SpeciesNameResolver) bool {
 	}
 	return false
 }
-
-// SetNameResolver is a no-op for legacy DataStore (common names stored in DB).
-func (ds *DataStore) SetNameResolver(_ SpeciesNameResolver) {}
 
 // SetSunCalcMetrics sets the metrics instance for the SunCalc service
 func (ds *DataStore) SetSunCalcMetrics(suncalcMetrics any) {
@@ -510,7 +510,7 @@ func (ds *DataStore) Save(note *Note, results []Results) error {
 			"total_duration_ms", time.Since(txStart).Milliseconds())
 	}
 
-	// Success — record metrics.
+	// Success: record metrics.
 	duration := time.Since(txStart)
 	txLogger.Info("Transaction completed",
 		logger.String("tx_id", txID),
@@ -640,6 +640,26 @@ func (ds *DataStore) GetNoteClipPath(noteID string) (string, error) {
 // The legacy schema does not track model types, so this always returns "bird".
 func (ds *DataStore) GetNoteModelType(_ string) (string, error) {
 	return "bird", nil
+}
+
+// GetNoteKeptSpectrogram returns the clip name of a spectrogram kept after retention
+// removed the detection's audio, and the model type. The legacy schema does not
+// persist the link, so the clip name is always empty and the model type is "bird".
+func (ds *DataStore) GetNoteKeptSpectrogram(_ string) (clipName, modelType string, err error) {
+	return "", "bird", nil
+}
+
+// RecordClipSampleRate is a no-op on the legacy store: its notes table has no
+// clip_sample_rate column (Note.ClipSampleRate is gorm:"-"). This stub exists only
+// because the legacy store still implements Interface and goes away with it.
+func (ds *DataStore) RecordClipSampleRate(_ context.Context, _ uint, _ string, _ int) error {
+	return nil
+}
+
+// FillClipSampleRate is a no-op on the legacy store, see RecordClipSampleRate. It
+// reports that no row changed. Removed together with the legacy store.
+func (ds *DataStore) FillClipSampleRate(_ context.Context, _ uint, _ string, _ int) (bool, error) {
+	return false, nil
 }
 
 // DeleteNoteClipPath deletes the field representing the path to the audio clip associated with a note.
@@ -2015,6 +2035,14 @@ func (ds *DataStore) GetLockedNotesClipPaths() ([]string, error) {
 	return clipPaths, nil
 }
 
+// RetainNoteSpectrogramsByClipNames is called when retention deleted the audio of the named
+// clips but a spectrogram render was kept. The legacy notes table has no column for the
+// spectrogram link, so this clears clip_name exactly like ClearNoteClipPathsByNames and the
+// kept render stays unlinked. Only the v2 store persists the link.
+func (ds *DataStore) RetainNoteSpectrogramsByClipNames(clipNames []string) (int64, error) {
+	return ds.ClearNoteClipPathsByNames(clipNames)
+}
+
 // ClearNoteClipPathsByNames clears the clip_name field for notes matching the given filenames.
 // This is used by the disk manager to remove stale references after audio files are deleted.
 // Updates are batched to stay within SQLite's parameter limit (999).
@@ -2695,14 +2723,11 @@ func (ds *DataStore) SearchDetections(filters *SearchFilters) ([]DetectionRecord
 	return results, int(total), nil
 }
 
-// getSunEventsForDate retrieves sun times for a given date
+// getSunEventsForDate retrieves sun times for the date of timestamp; dateStr only labels the
+// error. It relies on the SunCalc's own per-date cache, which follows the live station location;
+// caching here by date string alone would keep serving the previous location's times after a
+// location change.
 func (ds *DataStore) getSunEventsForDate(dateStr string, timestamp time.Time) (suncalc.SunEventTimes, error) {
-	// Check if the sun times are already cached
-	if cached, exists := ds.getCachedSunTimes(dateStr); exists {
-		return cached, nil
-	}
-
-	// Calculate sun times for the given date
 	sunTimes, err := ds.SunCalc.GetSunEventTimes(timestamp)
 	if err != nil {
 		return suncalc.SunEventTimes{}, errors.New(err).
@@ -2713,22 +2738,5 @@ func (ds *DataStore) getSunEventsForDate(dateStr string, timestamp time.Time) (s
 			Build()
 	}
 
-	// Cache the calculated sun times
-	ds.cacheSunTimes(dateStr, &sunTimes)
-
 	return sunTimes, nil
-}
-
-// getCachedSunTimes retrieves sun times from the cache
-func (ds *DataStore) getCachedSunTimes(dateStr string) (suncalc.SunEventTimes, bool) {
-	cached, exists := ds.sunTimesCache.Load(dateStr)
-	if exists {
-		return cached.(suncalc.SunEventTimes), true
-	}
-	return suncalc.SunEventTimes{}, false
-}
-
-// cacheSunTimes caches sun times
-func (ds *DataStore) cacheSunTimes(dateStr string, sunTimes *suncalc.SunEventTimes) {
-	ds.sunTimesCache.Store(dateStr, *sunTimes)
 }

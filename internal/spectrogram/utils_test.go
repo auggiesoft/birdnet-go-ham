@@ -2,17 +2,15 @@ package spectrogram
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	apperrors "github.com/tphakala/birdnet-go/internal/errors"
+	"github.com/tphakala/birdnet-go/internal/errors"
 )
 
 func TestSizeToPixels(t *testing.T) {
@@ -438,10 +436,10 @@ func TestIsOperationalError_HonorsPriorityLow(t *testing.T) {
 	t.Parallel()
 
 	// A Windows-style "exit status 1" tagged PriorityLow by the generator.
-	lowPriorityErr := apperrors.Newf("exit status 1").
+	lowPriorityErr := errors.Newf("exit status 1").
 		Component("spectrogram").
-		Category(apperrors.CategorySystem).
-		Priority(apperrors.PriorityLow).
+		Category(errors.CategorySystem).
+		Priority(errors.PriorityLow).
 		Build()
 	assert.True(t, IsOperationalError(lowPriorityErr),
 		"a CategorySystem error carrying PriorityLow should be classified as operational")
@@ -453,9 +451,9 @@ func TestIsOperationalError_HonorsPriorityLow(t *testing.T) {
 
 	// The same surface error without an explicit priority is a genuine failure and
 	// must still surface as a notification.
-	genuineErr := apperrors.Newf("exit status 1").
+	genuineErr := errors.Newf("exit status 1").
 		Component("spectrogram").
-		Category(apperrors.CategorySystem).
+		Category(errors.CategorySystem).
 		Build()
 	assert.False(t, IsOperationalError(genuineErr),
 		"an enhanced error without PriorityLow should not be classified as operational")
@@ -463,48 +461,13 @@ func TestIsOperationalError_HonorsPriorityLow(t *testing.T) {
 	// PriorityLow alone is not sufficient: a low-priority error in a category other
 	// than the CategorySystem the generator pairs with interruptions must not be
 	// misread as operational.
-	otherCategoryLowErr := apperrors.Newf("non-fatal validation issue").
+	otherCategoryLowErr := errors.Newf("non-fatal validation issue").
 		Component("spectrogram").
-		Category(apperrors.CategoryValidation).
-		Priority(apperrors.PriorityLow).
+		Category(errors.CategoryValidation).
+		Priority(errors.PriorityLow).
 		Build()
 	assert.False(t, IsOperationalError(otherCategoryLowErr),
 		"a PriorityLow error in a non-system category should not be classified as operational")
-}
-
-// TestIsOperationalExecError verifies the context-aware classification helper used at
-// the generator exec sites: a done context means the failure is attributable to
-// cancellation/timeout regardless of the platform-dependent surface error.
-func TestIsOperationalExecError(t *testing.T) {
-	t.Parallel()
-
-	t.Run("canceled context is operational regardless of surface error", func(t *testing.T) {
-		t.Parallel()
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-		// Errors that IsOperationalError alone would reject (the exact Windows
-		// surfaces: missing-binary lookup error and TerminateProcess exit code 1).
-		assert.True(t, isOperationalExecError(ctx, fmt.Errorf("executable file not found in PATH")))
-		assert.True(t, isOperationalExecError(ctx, fmt.Errorf("exit status 1")))
-	})
-
-	t.Run("deadline-exceeded context is operational", func(t *testing.T) {
-		t.Parallel()
-		ctx, cancel := context.WithTimeout(t.Context(), time.Nanosecond)
-		t.Cleanup(cancel)
-		<-ctx.Done()
-		assert.True(t, isOperationalExecError(ctx, fmt.Errorf("exit status 1")))
-	})
-
-	t.Run("live context delegates to IsOperationalError", func(t *testing.T) {
-		t.Parallel()
-		ctx := t.Context()
-		assert.False(t, isOperationalExecError(ctx, fmt.Errorf("exit status 1")),
-			"a genuine failure under a live context stays non-operational")
-		assert.True(t, isOperationalExecError(ctx, context.Canceled),
-			"a surfaced context.Canceled is operational even under a live context")
-		assert.True(t, isOperationalExecError(ctx, fmt.Errorf("process failed: %s", signalKilledMessage)))
-	})
 }
 
 func TestSizeToPixelsRoundTrip(t *testing.T) {

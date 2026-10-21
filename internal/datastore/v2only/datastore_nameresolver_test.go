@@ -22,16 +22,21 @@ func (f fakeResolver) ResolveLocal(sci string) (string, bool) {
 
 func TestResolveCommonName_ResolverOverridesLabelMap(t *testing.T) {
 	ds := &Datastore{
-		log:   logger.NewConsoleLogger("v2only_test", logger.LogLevelError),
-		names: speciesindex.New(nil),
+		log: logger.NewConsoleLogger("v2only_test", logger.LogLevelError),
 	}
-	ds.names.Rebuild([]string{"Turdus merula_LabelName"}, "")
 
-	// Without a resolver: the label map wins.
+	// Without a resolver: the label map wins. Install a shared index built from
+	// labels only, mirroring the fallback seed New() installs.
+	labelOnly := speciesindex.New(nil)
+	labelOnly.Rebuild([]string{"Turdus merula_LabelName"}, "")
+	ds.SetSpeciesIndex(labelOnly)
 	assert.Equal(t, "LabelName", ds.resolveCommonName("Turdus merula"))
 
-	// With a resolver: override even though the label map already has a name.
-	ds.SetNameResolver(fakeResolver{m: map[string]string{"Turdus merula": "Localized"}})
+	// Swap in a shared index whose resolver overrides the label-derived name, the
+	// way the orchestrator-owned service does once injected.
+	withResolver := speciesindex.New(fakeResolver{m: map[string]string{"Turdus merula": "Localized"}})
+	withResolver.Rebuild([]string{"Turdus merula_LabelName"}, "")
+	ds.SetSpeciesIndex(withResolver)
 	assert.Equal(t, "Localized", ds.resolveCommonName("Turdus merula"))
 
 	// Resolver miss on a species not in labels: falls back to the scientific name.
@@ -46,11 +51,11 @@ func TestResolveCommonName_RealOpenFaunaOverrides(t *testing.T) {
 	require.NoError(t, r.Rebuild([]string{"Turdus merula"}, "en"))
 
 	ds := &Datastore{
-		log:   logger.NewConsoleLogger("v2only_test", logger.LogLevelError),
-		names: speciesindex.New(nil),
+		log: logger.NewConsoleLogger("v2only_test", logger.LogLevelError),
 	}
-	ds.names.Rebuild([]string{"Turdus merula_WRONG"}, "")
-	ds.SetNameResolver(r)
+	svc := speciesindex.New(r)
+	svc.Rebuild([]string{"Turdus merula_WRONG"}, "")
+	ds.SetSpeciesIndex(svc)
 
 	got := ds.resolveCommonName("Turdus merula")
 	assert.NotEqual(t, "WRONG", got, "OpenFauna must override the label-derived name")
@@ -61,3 +66,27 @@ func TestResolveCommonName_RealOpenFaunaOverrides(t *testing.T) {
 // buildNameMaps directly (scientific-only labels searchable via a resolver, and
 // resolver-localized reverse maps) now live in internal/speciesindex, where the
 // shared builder is owned and golden-tested.
+
+func TestResolveCommonName_PerchSoundClass(t *testing.T) {
+	ds := &Datastore{
+		log: logger.NewConsoleLogger("v2only_test", logger.LogLevelError),
+	}
+	idx := speciesindex.New(nil)
+	idx.Rebuild([]string{"Domestic_sounds_and_home_sounds", "Domestic_animals_and_pets"}, "")
+	ds.SetSpeciesIndex(idx)
+
+	tests := []struct {
+		name   string
+		stored string
+		want   string
+	}{
+		{"domestic sounds", "Domestic_sounds_and_home_sounds", "Domestic sounds and home sounds"},
+		{"domestic animals", "Domestic_animals_and_pets", "Domestic animals and pets"},
+		{"legacy stored fragment falls back to itself", "Domestic", "Domestic"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ds.resolveCommonName(tt.stored))
+		})
+	}
+}

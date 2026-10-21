@@ -3,8 +3,8 @@
 package media
 
 import (
+	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,10 +22,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tphakala/birdnet-go/internal/api/middleware"
 	"github.com/tphakala/birdnet-go/internal/api/v2/apitest"
-	"github.com/tphakala/birdnet-go/internal/audiocore/ffmpeg"
+	"github.com/tphakala/birdnet-go/internal/audiocore/audiotemp"
 	"github.com/tphakala/birdnet-go/internal/datastore"
 	"github.com/tphakala/birdnet-go/internal/datastore/mocks"
 	"github.com/tphakala/birdnet-go/internal/diskmanager"
+	"github.com/tphakala/birdnet-go/internal/errors"
 	"github.com/tphakala/birdnet-go/internal/imageprovider"
 	"gorm.io/gorm"
 )
@@ -381,9 +382,8 @@ func TestServeAudioClip(t *testing.T) {
 	}
 }
 
-// TestServeSpectrogram tests the ServeSpectrogram handler using SecureFS
-// Note: This test verifies the handler logic calls SecureFS, but does not
-// guarantee actual spectrogram generation works if tools are missing.
+// TestServeSpectrogram tests the ServeSpectrogram handler using SecureFS,
+// including on-demand rendering by the built-in renderer.
 func TestServeSpectrogram(t *testing.T) {
 	// Setup test environment with SecureFS rooted in tempDir
 	e, controller, tempDir := setupMediaTestEnvironment(t)
@@ -395,7 +395,7 @@ func TestServeSpectrogram(t *testing.T) {
 	require.NoError(t, err)
 
 	// --- Simulate Spectrogram Generation (by creating the expected file) ---
-	// This allows testing the "file exists" path without running external tools.
+	// This allows testing the "file exists" path without rendering.
 	// Default is raw=true, so the filename format is audio_800px.png
 	spectrogramFilename := "audio_800px.png"
 	spectrogramFilePath := filepath.Join(tempDir, spectrogramFilename)
@@ -410,6 +410,7 @@ func TestServeSpectrogram(t *testing.T) {
 		width          string
 		expectedStatus int
 		expectedBody   string
+		expectPNG      bool // body is a freshly rendered PNG, not a fixed string
 	}{
 		{
 			name:           "Spectrogram generated/exists",
@@ -419,12 +420,11 @@ func TestServeSpectrogram(t *testing.T) {
 			expectedBody:   spectrogramContent,
 		},
 		{
-			name:     "Spectrogram needs generation (file doesn't exist initially)",
-			filename: audioFilename,
-			width:    "1200", // Different width means different file
-			// Expect error because external tools likely won't run in test
-			expectedStatus: http.StatusInternalServerError,
-			expectedBody:   "",
+			name:           "Spectrogram renders on demand (file doesn't exist initially)",
+			filename:       audioFilename,
+			width:          "1200", // Different width means different file
+			expectedStatus: http.StatusOK,
+			expectPNG:      true,
 		},
 		{
 			name:           "Non-existent audio file",
@@ -462,7 +462,11 @@ func TestServeSpectrogram(t *testing.T) {
 
 			// For success cases, check response content
 			if tc.expectedStatus == http.StatusOK {
-				assert.Equal(t, tc.expectedBody, rec.Body.String())
+				if tc.expectPNG {
+					assert.True(t, bytes.HasPrefix(rec.Body.Bytes(), []byte(pngSignature)), "body must be a PNG")
+				} else {
+					assert.Equal(t, tc.expectedBody, rec.Body.String())
+				}
 				assert.Equal(t, "image/png", rec.Header().Get("Content-Type"))
 			}
 		})
@@ -490,6 +494,42 @@ func setupMediaTestEnvironment(t *testing.T) (*echo.Echo, *Handler, string) {
 	// The media SecureFS is rooted at the per-test export path apitest.NewCore
 	// provisions (a t.TempDir()); tests create their fixture files under it.
 	return e, h, core.SFS.BaseDir()
+}
+
+// TestServeAudio_AlternateExtensionFallback verifies the extension-agnostic
+// recovery on the audio serve path: when the requested clip name's exact file is
+// missing but a sibling with a different known audio extension exists (a rare
+// clip_name/on-disk drift), the actual file is served and the response is labeled
+// by the file served, not by the requested extension.
+func TestServeAudio_AlternateExtensionFallback(t *testing.T) {
+	e, _, tempDir := setupMediaTestEnvironment(t)
+
+	// The real file on disk is FLAC (createTestAudioFile writes valid audio bytes;
+	// the serve path only cares about the extension for labeling).
+	require.NoError(t, createTestAudioFile(t, filepath.Join(tempDir, "drifted.flac")))
+
+	server := httptest.NewServer(e)
+	defer server.Close()
+
+	// The request (mirroring a stored clip_name) names .mp3, which does not exist.
+	resp, err := server.Client().Get(server.URL + "/api/v2/media/audio/drifted.mp3")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"the actual on-disk file must be served instead of a 404")
+	assert.Equal(t, MimeTypeFLAC, resp.Header.Get(echo.HeaderContentType),
+		"Content-Type must follow the file served, not the requested extension")
+	body, readErr := io.ReadAll(resp.Body)
+	require.NoError(t, readErr)
+	assert.NotEmpty(t, body, "the served alternate file must have a non-empty body")
+
+	// A genuinely absent clip (no sibling in any known audio format) still 404s.
+	resp2, err := server.Client().Get(server.URL + "/api/v2/media/audio/nonexistent.mp3")
+	require.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, resp2.StatusCode,
+		"a clip with no on-disk file in any format must still 404")
 }
 
 // TestMediaEndpointsIntegration tests the media endpoints in an integrated way
@@ -525,6 +565,7 @@ func TestMediaEndpointsIntegration(t *testing.T) {
 		expectedStatus int
 		expectedBody   string
 		isAudioFile    bool // Flag to indicate if this is an audio file that needs special handling
+		expectPNG      bool // body is a freshly rendered PNG, not a fixed string
 	}{
 		{
 			name:           "Audio endpoint",
@@ -541,11 +582,10 @@ func TestMediaEndpointsIntegration(t *testing.T) {
 			isAudioFile:    false,
 		},
 		{
-			name:           "Spectrogram endpoint (needs generation - likely fails)",
+			name:           "Spectrogram endpoint (renders on demand)",
 			endpoint:       "/api/v2/media/spectrogram/" + audioFilename + "?width=1200",
-			expectedStatus: http.StatusInternalServerError,
-			expectedBody:   "",
-			isAudioFile:    false,
+			expectedStatus: http.StatusOK,
+			expectPNG:      true,
 		},
 		{
 			name:           "Missing audio file",
@@ -573,6 +613,11 @@ func TestMediaEndpointsIntegration(t *testing.T) {
 			if tc.expectedStatus == http.StatusOK {
 				body, err := io.ReadAll(resp.Body)
 				require.NoError(t, err)
+				if tc.expectPNG {
+					assert.True(t, bytes.HasPrefix(body, []byte(pngSignature)), "body must be a PNG")
+					assert.Equal(t, "image/png", resp.Header.Get("Content-Type"))
+					return
+				}
 				assertMediaResponseBody(t, body, tc.expectedBody, tc.isAudioFile)
 			}
 		})
@@ -1077,7 +1122,7 @@ func TestTranslateAudioServeErrorClearsHeadersBeforeCommittedJSON(t *testing.T) 
 	ctx.Response().Header().Set(echo.HeaderContentDisposition, "inline; filename*=UTF-8''test.wav")
 	ctx.Response().Header().Set(headerAcceptRanges, acceptRangesBytes)
 
-	require.NoError(t, controller.translateAudioServeError(ctx, errors.New("forced serve failure"), "Failed to serve audio"))
+	require.NoError(t, controller.translateAudioServeError(ctx, errors.NewStd("forced serve failure"), "Failed to serve audio"))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.Contains(t, rec.Header().Get(echo.HeaderContentType), echo.MIMEApplicationJSON)
 	assert.Empty(t, rec.Header().Get(echo.HeaderContentDisposition))
@@ -1641,17 +1686,17 @@ func TestIsExportTempFor(t *testing.T) {
 		file string
 		want bool
 	}{
-		{"unique format", base + ".12345.1" + ffmpeg.TempExt, true},
-		{"unique format large seq", base + ".987.4096" + ffmpeg.TempExt, true},
-		{"pre-fix legacy format", base + ffmpeg.TempExt, true},
+		{"unique format", base + ".12345.1" + audiotemp.Ext, true},
+		{"unique format large seq", base + ".987.4096" + audiotemp.Ext, true},
+		{"pre-fix legacy format", base + audiotemp.Ext, true},
 		{"final clip", base, false},
 		{"final clip other ext", base + ".part", false},
-		{"sidecar spectrogram temp", base + ".png.12345.1" + ffmpeg.TempExt, false},
-		{"different clip", "other_99p_20260531T084138Z.m4a.12345.1" + ffmpeg.TempExt, false},
-		{"non-integer pid", base + ".abc.1" + ffmpeg.TempExt, false},
-		{"non-integer seq", base + ".12345.x" + ffmpeg.TempExt, false},
-		{"missing seq", base + ".12345" + ffmpeg.TempExt, false},
-		{"extra middle segment", base + ".12345.1.2" + ffmpeg.TempExt, false},
+		{"sidecar spectrogram temp", base + ".png.12345.1" + audiotemp.Ext, false},
+		{"different clip", "other_99p_20260531T084138Z.m4a.12345.1" + audiotemp.Ext, false},
+		{"non-integer pid", base + ".abc.1" + audiotemp.Ext, false},
+		{"non-integer seq", base + ".12345.x" + audiotemp.Ext, false},
+		{"missing seq", base + ".12345" + audiotemp.Ext, false},
+		{"extra middle segment", base + ".12345.1.2" + audiotemp.Ext, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1673,7 +1718,7 @@ func TestServeAudioClipWaitsForEncoding(t *testing.T) {
 	// Mirror the per-export unique temp name "<clip>.<pid>.<seq>.temp" the real
 	// exporters write, so this exercises the directory-scan detection in
 	// isAudioBeingEncoded rather than a fixed name that production never produces.
-	tempFilePath := audioFilePath + ".99999.1" + ffmpeg.TempExt
+	tempFilePath := audioFilePath + ".99999.1" + audiotemp.Ext
 	require.NoError(t, os.WriteFile(tempFilePath, []byte("temp encoding data"), 0o600))
 
 	waitStarted := make(chan struct{})
@@ -1710,7 +1755,7 @@ func TestServeAudioByIDWaitsForEncodingPreservesHeaders(t *testing.T) {
 
 	audioFilename := "turdus_migratorius_88p_20260724T143045Z.wav"
 	audioFilePath := filepath.Join(tempDir, audioFilename)
-	tempFilePath := audioFilePath + ".99999.1" + ffmpeg.TempExt
+	tempFilePath := audioFilePath + ".99999.1" + audiotemp.Ext
 	require.NoError(t, os.WriteFile(tempFilePath, []byte("temp encoding data"), 0o600))
 
 	mockDS := mocks.NewMockInterface(t)
@@ -1759,7 +1804,7 @@ func TestServeAudioClipReturns503AfterTimeout(t *testing.T) {
 	// Mirror the per-export unique temp name "<clip>.<pid>.<seq>.temp" the real
 	// exporters write, so this exercises the directory-scan detection in
 	// isAudioBeingEncoded rather than a fixed name that production never produces.
-	tempFilePath := audioFilePath + ".99999.1" + ffmpeg.TempExt
+	tempFilePath := audioFilePath + ".99999.1" + audiotemp.Ext
 
 	// Create only the temp file; the final file never appears.
 	err := os.WriteFile(tempFilePath, []byte("temp encoding data"), 0o600)
@@ -1846,7 +1891,7 @@ func TestIsRecentClipCompletion(t *testing.T) {
 // TestServeAudioByID_GraceSkippedForOldDetections verifies the defense-in-depth
 // grace-poll skip: a 404 for a detection whose capture completed long ago returns
 // immediately (no grace wait), while a recent detection still waits out the grace
-// period. Timing bounds around audioGracePeriod distinguish the two paths.
+// period and then answers 503 with Retry-After. Timing bounds around audioGracePeriod distinguish the two paths.
 func TestServeAudioByID_GraceSkippedForOldDetections(t *testing.T) {
 	// clipPath resolves but the file does not exist on disk, forcing the 404 path.
 	const missingClip = "2024/01/ghost_95p_20240101T000000Z.wav"
@@ -1854,17 +1899,20 @@ func TestServeAudioByID_GraceSkippedForOldDetections(t *testing.T) {
 	tests := []struct {
 		name       string
 		endTime    time.Time
+		wantStatus int
 		maxElapsed time.Duration // set: proves grace was skipped
 		minElapsed time.Duration // set: proves grace ran
 	}{
 		{
 			name:       "old detection skips grace and 404s immediately",
 			endTime:    time.Now().Add(-time.Hour),
+			wantStatus: http.StatusNotFound,
 			maxElapsed: audioGracePeriod,
 		},
 		{
-			name:       "recent detection still waits the grace period",
+			name:       "recent detection waits the grace period and answers 503 while the export may be queued",
 			endTime:    time.Now(),
+			wantStatus: http.StatusServiceUnavailable,
 			minElapsed: audioGracePeriod,
 		},
 	}
@@ -1888,12 +1936,19 @@ func TestServeAudioByID_GraceSkippedForOldDetections(t *testing.T) {
 			handlerErr := controller.ServeAudioByID(c)
 			elapsed := time.Since(start)
 
-			// The missing clip resolves to a 404, returned as an echo.HTTPError
-			// (the framework translates it to the HTTP response).
-			require.Error(t, handlerErr, "missing clip must error")
-			httpErr, ok := errors.AsType[*echo.HTTPError](handlerErr)
-			require.True(t, ok, "expected an echo.HTTPError")
-			assert.Equal(t, http.StatusNotFound, httpErr.Code, "missing clip must 404")
+			if tc.wantStatus == http.StatusNotFound {
+				// The missing clip resolves to a 404, returned as an echo.HTTPError
+				// (the framework translates it to the HTTP response).
+				require.Error(t, handlerErr, "missing clip must error")
+				httpErr, ok := errors.AsType[*echo.HTTPError](handlerErr)
+				require.True(t, ok, "expected an echo.HTTPError")
+				assert.Equal(t, http.StatusNotFound, httpErr.Code, "missing clip must 404")
+			} else {
+				// A pending answer is written directly with a Retry-After hint.
+				require.NoError(t, handlerErr)
+				assert.Equal(t, tc.wantStatus, rec.Code)
+				assert.NotEmpty(t, rec.Header().Get(echo.HeaderRetryAfter), "503 must carry Retry-After")
+			}
 			if tc.maxElapsed > 0 {
 				assert.Less(t, elapsed, tc.maxElapsed,
 					"old detection must skip the grace wait")
